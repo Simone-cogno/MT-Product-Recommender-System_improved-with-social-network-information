@@ -1,0 +1,13 @@
+.idea
+*.pyc
+*.jar
+*.log
+*.class
+*.cache
+Code/Prototype1/results
+Code/Prototype1/target
+Code/Prototype1/project
+*.txt
+*.pem
+*.log
+Code/CreateDatasetCassandra/error.log
