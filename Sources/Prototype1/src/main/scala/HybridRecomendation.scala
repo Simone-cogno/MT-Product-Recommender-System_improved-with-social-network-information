@@ -34,11 +34,11 @@ object HybridRecomendation {
   def main(args: Array[String]): Unit = {
     //Spark configuration
     val conf = new SparkConf(true)
-        .set("spark.cassandra.connection.host", "XX-XX-XX-XX") //Cassandra server configuration
+        .set("spark.cassandra.connection.host", "54.229.218.236") //Cassandra server configuration
         .set("spark.cassandra.input.fetch.size_in_rows", "10") //Limit fetch size
         //.set("connection.compression", "SNAPPY")
         //.setAppName("Simple Application")
-        .setMaster("spark://XX-XX-XX-XX:7077")
+        .setMaster("spark://ec2-54-229-217-107.eu-west-1.compute.amazonaws.com:7077")
         //.setMaster("local[8]")
         .setJars(Seq(System.getProperty("user.dir") + "/my-project-assembly.jar"))
 
@@ -55,7 +55,7 @@ object HybridRecomendation {
       .where("private = ?", false)
 
     //Store users size for later use
-    val users_size = sc.broadcast(rdd.count())
+    val users_size = rdd.count()
 
     //Debug print number of users on the dataset
     println(rdd.count())
@@ -100,6 +100,7 @@ object HybridRecomendation {
       val test = x.getList[UDTValue]("list_reviews").slice(train_index, size)
       (x.get[Int]("gid"), (train, test))
     }.cache()
+
     //RDD(Int, (Vector(UDT), Vector(-udt)))) (ugid, (vector(train), Vector(test)))
     rdd.unpersist()
 
@@ -179,7 +180,7 @@ object HybridRecomendation {
     //Feature weighting
     val feature_users_indexed_matrix=user_feature_matrix.transpose.toIndexedRowMatrix()
     val feature_users_rows=feature_users_indexed_matrix.rows
-    val feature_weight=feature_users_rows.map{case IndexedRow(is, v)=> (is, log10(users_size.value/v.numActives.toDouble))}
+    val feature_weight=feature_users_rows.map{case IndexedRow(is, v)=> (is, log10(users_size/v.numActives.toDouble))}
                                          .collectAsMap()
 
     //User and Vector of the weighted features
@@ -195,9 +196,9 @@ object HybridRecomendation {
     val similarities_pairs=user_feature_paris.cartesian(user_feature_paris).filter{case ((u1,v1),(u2,v2)) => u1!=u2  }
       .map{case (((u1,v1),(u2,v2)))=> (u1,(u2, cosineSimilarity(v1,v2)))}
       .filter{case (u1,(u2, sim)) => sim> MinUsersSimilarity} //TODO adjust the minimum similarity threashold
-      .groupByKey
+      .groupByKey()
 
-    //Get the 20 similar users
+    //Get the N similar users
     val n_mostSimilarUsers=similarities_pairs.flatMap{case (u, sim)=>
       sim.toArray
         .sortBy(_._2).map(_._1)
@@ -255,7 +256,7 @@ object HybridRecomendation {
 
     //Accuracy of the prediction by users
     val accuracy_rate=results.join(testItems)  // (u, (Array[b_res], Array[b_test]))
-                             .map{case (u,(b_res, b_test)) => (u, b_res.intersect(b_test).size.toDouble / b_test.size.toDouble * 100.0) }
+                             .map{case (u,(b_res, b_test)) => (u, b_res.intersect(b_test).size.toDouble / b_test.length.toDouble * 100.0) }
 
 
     //val top_N_with_id=top_N_items.join(user_id_map.map(_.swap)).map{case (iu, (ib_w, u)=> (iu, (ib_w.join(items_id_map.map(._swap)), u)))} //RDD[Long, (Array(Long, Int), Int)]
@@ -263,7 +264,7 @@ object HybridRecomendation {
 
     //Save recommendation
     val format = new SimpleDateFormat("y-M-d-hh-mm-ss")
-    val dateString=format.format(Calendar.getInstance().getTime())
+    val dateString=format.format(Calendar.getInstance().getTime)
     val myRDD = top_N_items.map{case (u, lb_f)=>u+", "+ lb_f.mkString(",") }
                             .saveAsTextFile("s3n://prs-simone/"+dateString+"/train")
     rdd_splitted.map{case (ugid, (vtr, vt))=> ugid+", "+vt.map(y=>y.get[UDTValue]("book").get[Int]("gid"))
@@ -276,13 +277,13 @@ object HybridRecomendation {
     accuracy_rate.saveAsTextFile("s3n://prs-simone/"+dateString+"/accuracy_rate")
     val acc_rate=accuracy_rate.map(_._2).collect()
 
-    sc.parallelize( List(acc_rate.sum / acc_rate.size.toDouble, acc_rate.max )).saveAsTextFile("s3n://prs-simone/"+dateString+"/mean_accuracy_rate")
+    sc.parallelize( List(acc_rate.sum / acc_rate.length.toDouble, acc_rate.max )).saveAsTextFile("s3n://prs-simone/"+dateString+"/mean_accuracy_rate")
 
     sc.stop()
 
 
 
-    //Save to cassandra the results
+    //Save the results to cassandra
     /*case class Recommendation(id: UUID, user_gid: Int, item_recommended: scala.collection.immutable.Vector[Int])
     val collection = sc.parallelize(Seq(Recommendation( UUID.randomUUID(), 23, Vector(1,2,3)),
                                         Recommendation( UUID.randomUUID(), 24, Vector(2,3,6))))
