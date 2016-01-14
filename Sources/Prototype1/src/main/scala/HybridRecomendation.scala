@@ -1,206 +1,125 @@
 package main.scala
 
-import java.util.UUID
-
-
-import org.apache.spark.SparkContext
-import org.apache.spark.SparkContext._
-import org.apache.spark.SparkConf
-import com.datastax.spark.connector._
-import org.apache.spark.ml.recommendation.ALS.Rating
-import org.apache.spark.mllib.linalg.{Vectors, Vector, SparseVector}
-import org.apache.spark.mllib.linalg.distributed._
-import Function.tupled
-import scala.math._
-import scala.util.Random.nextInt
-import java.util.Calendar
 import java.text.SimpleDateFormat
+import java.util.Calendar
+
+import org.apache.spark.mllib.linalg.Vector
+import org.apache.spark.rdd.RDD
+import org.apache.spark.storage.StorageLevel
+import org.apache.spark.{SparkConf, SparkContext}
+
+import scala.Array._
 import scala.math._
-import java.lang._
 
 /**
- * Created by Simo on 11.12.15.
+ * This Spark application perform an Hybrid recommendation by using information about product
+ * retrieved from Goodreads.com and epinions.com.
+ *
+ * Created by Simone Cogno on 11.12.15.
  */
 object HybridRecomendation {
-  val MinUsersSimilarity = 0.1
-  val NSimilarUsers=20
-  val NRecemendedItems=100
+
+  //Costants definition
+  val MinUsersSimilarity = 0.3 //Minimum similarity between user neighborhood
+  val NSimilarUsers=15         //Size of the Neighborhood
+  val NRecemendedItems=50      //Number of recommended items
   val DefaultFeatureValue=1.0
-  val MinShelveVotes=10
-  val TrainSetPercentage=0.7
-
-
+  val MinShelveVotes=5         //Minimum user rating for a shelve to take it into account
+  val TrainSetPercentage=0.75
+  val Debug=false              //Print debug informations
+  val Local=true               //Application will run in the local machine
+  val SavePathS3="s3n://prs-simone/results/"  //Default path for save the results of the computation
+  val SavePathLocal="/Users/Simo/Google Drive/Master thesis/Document/MT-product-recommender-system-improved-with-social-netowrk-informations/Code/Prototype1/results/"
+  val ReadPathS3="s3n://prs-simone/input/"    //Default path for read the input dataset
+  val ReadPathLocal="/Users/Simo/Google Drive/Master thesis/Document/MT-product-recommender-system-improved-with-social-netowrk-informations/Code/Prototype1/goodreads"
 
   def main(args: Array[String]): Unit = {
     //Spark configuration
-    val conf = new SparkConf(true)
-        .set("spark.cassandra.connection.host", "54.229.218.236") //Cassandra server configuration
-        .set("spark.cassandra.input.fetch.size_in_rows", "10") //Limit fetch size
-        //.set("connection.compression", "SNAPPY")
-        //.setAppName("Simple Application")
-        .setMaster("spark://ec2-54-229-217-107.eu-west-1.compute.amazonaws.com:7077")
-        //.setMaster("local[8]")
-        .setJars(Seq(System.getProperty("user.dir") + "/my-project-assembly.jar"))
-
+    val conf = new SparkConf(true).setAppName("Hybrid Algorithm")
+    if(Local) {
+      conf.setMaster("local[8]")
+    }else{
+      conf.setMaster("spark://MASTER-IP:7077")
+          .setJars(Seq(System.getProperty("user.dir") + "/my-project-assembly.jar")) //Dependencies jar
+    }
 
     //Create a Spark context
     val sc= new SparkContext(conf)
-    val testfile=sc.textFile("s3n://prs-simone/test-s3.txt")
-    println(testfile.count())
+
+    //Select the input path
+    var readPath=""
+    if(Local)
+      readPath=ReadPathLocal
+    else
+      readPath=ReadPathS3
 
 
-    //Read users reviews
-    val rdd = sc.cassandraTable("prs", "users")
-      .select("id","gid", "name", "list_reviews")
-      .where("private = ?", false)
+    //Read the user, items and shelves of the dataset from S3
+    val user_item_shelves: RDD[(Int, Array[(Int, Array[Int])])] =sc.objectFile(readPath+"/2016-1-14-10-40-15-19users")
+    .persist(StorageLevel.MEMORY_AND_DISK_2)
 
-    //Store users size for later use
-    val users_size = rdd.count()
+    //Count the number of users
+    val users_size = user_item_shelves.count()
 
-    //Debug print number of users on the dataset
-    println(rdd.count())
-
-    //Tuples of users goodreads id and matrix index
-    val user_id_map=rdd.map(x=>x.get[Int]("gid"))
-      .distinct()
-      .zipWithIndex()
-      .cache()
-
-    //Tuple of matrix index and goodreads id
-    val user_id_map_reversed=user_id_map.map(_.swap)
-
-
-    //Items gid asociated to the matrix index
-    val items_id_map=rdd.flatMap(x=>x.getList[UDTValue]("list_reviews")
-      .toArray
-      .map(y=> y.get[UDTValue]("book").get[Int]("gid")))
-      .distinct()
-      .zipWithIndex()
-
-    //Shelve gid associated with the matrix index
-    val shelve_id_map=rdd.flatMap(x=> x.getList[UDTValue]("list_reviews")
-      .toArray.flatMap(y=>  y.get[UDTValue]("book")
-                             .getList[UDTValue]("list_shelves")
-      .toArray
-      .filter(z=>(z.get[Int]("count")>10 &&
-        !z.get[String]("shelve").contains("to") &&
-        !z.get[String]("shelve").contains("read") &&
-        !z.get[String]("shelve").contains("own") &&
-        !z.get[String]("shelve").contains("my-books")))
-      .map(z=> z.get[String]("shelve"))))
-      .distinct()
-      .zipWithIndex().cache()
-
+    println("users size: "+users_size)
+    if(Debug)user_item_shelves.foreach(x=>println(x._1+": "+ x._2.map(y=> "("+y._1+","+y._2.mkString(",")+")").mkString(",")+")"))
 
     //Split the rdd between train and test set
-    val rdd_splitted=rdd.map { (x: CassandraRow) =>
-      val size: Int = x.getList[UDTValue]("list_reviews").size
-      val train_index: Int = (size * TrainSetPercentage).asInstanceOf[Int]
-      val train = x.getList[UDTValue]("list_reviews").slice(0, train_index)
-      val test = x.getList[UDTValue]("list_reviews").slice(train_index, size)
-      (x.get[Int]("gid"), (train, test))
-    }.cache()
-
-    //RDD(Int, (Vector(UDT), Vector(-udt)))) (ugid, (vector(train), Vector(test)))
-    rdd.unpersist()
-
-
+    val rdd_splitted=user_item_shelves.map {case (u, ib_is)=>
+      val size: Int = ib_is.length
+      var train: Array[(Int, Array[Int])]=Array()
+      var test: Array[(Int, Array[Int])]=Array()
+      ib_is.foreach{x=>
+        if(scala.util.Random.nextDouble()<TrainSetPercentage){
+          train=train:+x
+        }else{
+          test=test:+x
+        }
+      }
+      (u, (train, test))
+    }.persist(StorageLevel.MEMORY_AND_DISK_2)
 
     //Create list of user, item, reviews and list of shelves and retrieve their unique index
-    val user_items_pairs1=rdd_splitted.flatMap(x=>
-      x._2._1 //Trainset
-      .toArray
-      .map(y=>    (x._1,
-                  (y.get[UDTValue]("book").get[Int]("gid"),
-                  (1.0, y.get[UDTValue]("book")
-                  .getList[UDTValue]("list_shelves")
-                  .toArray
-                  .filter(z=>( z.get[Int]("count")>MinShelveVotes &&
-                      !z.get[String]("shelve").contains("to") &&
-                      !z.get[String]("shelve").contains("read") &&
-                      !z.get[String]("shelve").contains("own") &&
-                      z.get[String]("shelve")!="my-books"))
-                  .map(x=>x.get[String]("shelve")
-                  ))))))
-      //RDD[Int, (Int,(Double, Array(String)))] (u,(b,(r,ls)))
+    val user_ff=rdd_splitted.flatMap{case (u, (train, test))=>
+      val shelves=train.flatMap(_._2)
+      shelves.groupBy(x=>x).map(x=>(x._1, x._2.length))
+                    .toArray
+                    .map{case (s,ff)=> (s,(u, ff))}
+    } //(u, (feature, f. frequency))
+    .persist(StorageLevel.MEMORY_AND_DISK)
 
-    //Retrieve the index of avery items and user
-    val user_items_with_user_index=user_items_pairs1.join(user_id_map).map{case (u, ((b, (r, ls)), iu)) => (b,(iu, (u, (r,ls))))}
-    val user_items_with_both_index=user_items_with_user_index.join(items_id_map).cache() //(b,((iu,(u,(r,ls))),ib))
 
-    //Create user item matrix
-    val user_item_matrix=new CoordinateMatrix(user_items_with_both_index
-      .map{case (b,((iu,(u,(r,ls))),ib)) => new MatrixEntry(iu, ib, r)})
-      .toBlockMatrix()
-      .cache()
+    if(Debug) println("user_ff")
+    if(Debug)user_ff.foreach(x=>println(x._1+": "+x._2))
+
+    //Calculate the user feature frequency in the whole dataset
+    val ffw=user_ff.map{case (s,(u, ff))=>(s, u)}
+                   .groupByKey()
+                   .map{case (s, s_u)=> (s, log10(users_size.toDouble/s_u.toArray.distinct.length.toDouble))}
+
+
+    //Weight user features
+    val user_ffw=user_ff.join(ffw).map { case (s, ((u, ff), fw)) =>
+      (u, (s, fw * ff.toDouble))
+    }.groupByKey()
+    .persist(StorageLevel.MEMORY_AND_DISK)
 
 
 
-    //Retrived the index of shelves
-    val item_shelve=user_items_with_both_index.flatMap{case (b,((iu,(u,(r,ls))),ib))=>ls.map((x:String) => (x, (ib, iu)))}
-    val item_shelve_with_index=item_shelve.join(shelve_id_map)
-
-    //Create item shelves matrix
-    val item_shelve_matrix=new CoordinateMatrix(item_shelve_with_index.map{case (s,((ib,iu),is)) => (ib,is)}
-      .distinct()
-      .map{case (ib,is) =>new MatrixEntry(ib, is, DefaultFeatureValue)})
-      .toBlockMatrix()
-      .cache()
-
-    //Debug: Print matrices dimensions
-    println(user_item_matrix.numCols())
-    println(user_item_matrix.numRows())
-    println(item_shelve_matrix.numRows())
-    println(item_shelve_matrix.numCols())
-
-
-    //Debug vectors
-    //val v1=Vectors.dense(Array(0.60, 0.24, 0.30, 0))
-    //val v2=Vectors.dense(Array(0.30, 0.24, 0, 0))
-
-    //Function for calculate the cosine similarity between two vector
-    def cosineSimilarity(v1: Vector, v2: Vector):Double={
-      val v1_indexes: Array[Int]=v1.toSparse.indices
-      val v2_indexes: Array[Int]=v2.toSparse.indices
-      val indexes=v1_indexes.intersect(v2_indexes)
-      if(indexes.length ==0) {
-        0.0
-      }else {
-        val num = indexes.map(i => v1.apply(i) * v2.apply(i)).sum
-        val v1_d = Math.sqrt(indexes.map(i => Math.pow(v1.apply(i), 2)).sum)
-        val v2_d = Math.sqrt(indexes.map(i => Math.pow(v2.apply(i), 2)).sum)
-        num / (v1_d * v2_d)
-      }
-    }
-
-    //Calculate user feature matrix
-    val user_feature_matrix=user_item_matrix.multiply(item_shelve_matrix)
-                                            .cache()
-
-    //Feature weighting
-    val feature_users_indexed_matrix=user_feature_matrix.transpose.toIndexedRowMatrix()
-    val feature_users_rows=feature_users_indexed_matrix.rows
-    val feature_weight=feature_users_rows.map{case IndexedRow(is, v)=> (is, log10(users_size/v.numActives.toDouble))}
-                                         .collectAsMap()
-
-    //User and Vector of the weighted features
-    val user_feature_paris=user_feature_matrix.toIndexedRowMatrix().rows.map{case IndexedRow(iu, v)=> (iu,
-      Vectors.sparse(v.size, v.toSparse.indices, v.toSparse.indices.map(
-        i=> v.apply(i) * feature_weight(i))
-      ))} // (iu, Vector(features_normalized))
-      .join(user_id_map_reversed)
-      .map{case (iu, (fw, u)) => (u, fw)}
-      .cache()
 
     //Calculate the cosine similarities between users (u1, (u2, csim(u1,u2)))
-    val similarities_pairs=user_feature_paris.cartesian(user_feature_paris).filter{case ((u1,v1),(u2,v2)) => u1!=u2  }
-      .map{case (((u1,v1),(u2,v2)))=> (u1,(u2, cosineSimilarity(v1,v2)))}
-      .filter{case (u1,(u2, sim)) => sim> MinUsersSimilarity} //TODO adjust the minimum similarity threashold
-      .groupByKey()
+    val similarities_pairs=user_ffw.cartesian(user_ffw)
+                                .filter{case ((u1,m1),(u2,m2)) => u1!=u2} //Filter if user
+                                .map{case (((u1,a1),(u2,a2)))=> (u1,(u2, cosineSimilarityList(a1.toList,a2.toList)))}
+                                .filter{case (u1,(u2, sim)) => sim> MinUsersSimilarity}
+                                .groupByKey()
 
-    //Get the N similar users
-    val n_mostSimilarUsers=similarities_pairs.flatMap{case (u, sim)=>
-      sim.toArray
+    if(Debug)println("similarities_pairs")
+    if(Debug)similarities_pairs.foreach(x=>println(x._1+": "+x._2.mkString(",")))
+
+    //Get the N most similar users
+    val n_mostSimilarUsers=similarities_pairs.flatMap{case (u, sim_u)=>
+      sim_u.toArray
         .sortBy(_._2).map(_._1)
         .reverse
         .take(NSimilarUsers)
@@ -208,89 +127,104 @@ object HybridRecomendation {
     }
 
 
-
-    //Ge the gid of user and items
-    val user_items_with_gid=user_items_pairs1.flatMap{case (u,(b, (r, ls)))=>
-      ls.map((s:String) => (u, (b, s)))}
-      .groupByKey
-
+    if(Debug)println("n_mostSimilarUsers")
+    if(Debug)n_mostSimilarUsers.foreach(println)
 
     //Get the items in the neighborhood (iu, Array[(ib, Iterable(is)]))
-    val user_items=n_mostSimilarUsers.join(user_items_with_gid) //user_items_pairs)
-        .map{case (siu, (iu, ibis)) => (iu, ibis)}
-        .groupByKey //RDD[(Long, Iterable[(Long, Long)])]
-        .map{case (iu, ibis)=>  (iu, ibis.flatten)}//RDD[(iu, Iterable[(ib, is)])]
-        .cache()
+    val user_items_join=n_mostSimilarUsers.join(user_item_shelves)
 
-    //Get the feature frequency in the neighborhood (u,(Array[(s, ff)]))
-    val item_feature_frequency=user_items.map{
-      case (iu, ibis) => (iu, ibis.groupBy( _._2 ).mapValues(_.size).toArray)//RDD[(iu, Array[(is, Iterable(numIsInThe neightbor of iu))])]
-    }
-
-    //Join the feature frequency to the items frequency
-    val user_items_FF=user_items.join(item_feature_frequency)//RDD[(Long, (Iterable[(Long, Long)], Array[(Long, Int)]))]
-      .map{
-        case (iu, (ibis, listFF))=> (iu,
-          ibis.map{
-            case (ib, is)=> (ib,( is, listFF.find(_._1 == is).get._2))
-          })
-      }//RDD[(Long, Iterable[(Long, (Long, Int))])]
-
-    //Get the N items that consists of features that are prevalent in the feature profiles of the user neighbors
-    //RDD[(iu, Array[(ib, sumff)])]
-    val top_N_items=user_items_FF.map{
-      case (iu, ib_is_ff)=> (iu,  ib_is_ff.groupBy( _._1 )
-          .mapValues(_.map(_._2._2).sum)
+    ///Get the N items that consists of features that are prevalent in the feature profiles of the user neighborhood
+    val top_N_items=user_items_join.flatMap{case (siu, (iu, ibis)) => ibis.flatMap{case (ib, ais)=>ais.map(s=>
+      (iu, (ib, s))
+    )}}
+      //Aggegate a feature->items map for retrieve the items frquency in the user neightborhood
+      .aggregateByKey(Map[Int, Set[Int]]())((m1, v)=>{
+        v match { case (ib, is)=>m1+(is->(m1.getOrElse[Set[Int]](is, Set())+ib))}},
+        (m1, m2)=> m1++m2.map{case (k,v)=>k->(m1.getOrElse[Set[Int]](k, Set())++v)}
+      )
+      .map{case (u, m)=> //Get the feature frquency in the neighborhood
+        (u, m.toArray.flatMap{case (k,sib)=>
+          sib.map{ib=>(ib, sib.size)}
+        }
+          )
+      }//Take the top N items based on its feature weight
+      .map{case (u, ib_nbfw)=>
+        (u, ib_nbfw.groupBy(_._1)
+          .map{case (k,ibf)=>k->ibf.map(_._2).sum}
           .toArray
           .sortBy(_._2)
           .reverse
-          .take(NRecemendedItems) //Adjust the number of items to reccomend
-        )
-    }
+          .take(NRecemendedItems))
+      }.persist(StorageLevel.MEMORY_AND_DISK)
+
+    if(Debug)println("User reviews")
+    if(Debug)top_N_items.foreach(x=>println(x._1+": "+ x._2.mkString(",")))
 
     //Test set items
-    val testItems=rdd_splitted.map{case (ugid, (vtr, vt))=> (ugid, vt.map(y=>y.get[UDTValue]("book").get[Int]("gid")).toArray)} // (ugid, bgid)
-
+    val testItems=rdd_splitted.map{case (ugid, (vtr, vt))=> (ugid, vt.map(y=>y._1))} // (ugid, bgid)
+                              .persist(StorageLevel.MEMORY_AND_DISK)
     //Recommended items
     val results=top_N_items.map{case (u, lb_f)=>(u, lb_f.map{case (b, ff)=>b})}
+                           .persist(StorageLevel.MEMORY_AND_DISK)
 
-    //Accuracy of the prediction by users
-    val accuracy_rate=results.join(testItems)  // (u, (Array[b_res], Array[b_test]))
-                             .map{case (u,(b_res, b_test)) => (u, b_res.intersect(b_test).size.toDouble / b_test.length.toDouble * 100.0) }
+    //Calculate the True Positive items number
+    val user_tp=results.join(testItems)  // (u, (Array[b_res], Array[b_test]))
+                           .map{case (u,(b_res, b_test)) => (u, b_res.intersect(b_test).length.toDouble)}
+                           .persist(StorageLevel.MEMORY_AND_DISK)
 
+    //Calculate the False Negative items number
+    val user_fn=user_tp.join(testItems).map{case (u,(tp, b_test))=> (u, b_test.length-tp)}
 
-    //val top_N_with_id=top_N_items.join(user_id_map.map(_.swap)).map{case (iu, (ib_w, u)=> (iu, (ib_w.join(items_id_map.map(._swap)), u)))} //RDD[Long, (Array(Long, Int), Int)]
-    //top_N_items.collect().foreach{ x => (print(x._1+": "), x._2.foreach((y:(Int, Int)) =>print(" ("+y._1+","+y._2+")")), println())}
+    //Calculate the False Positive items number
+    val user_fp=user_tp.join(results).map{case (uid, (tp, recom))=> (uid, recom.length-tp)}
 
-    //Save recommendation
+    //Precision tp/(tp+fp)
+    val user_precision=user_tp.join(user_fp).map{case (uid,(tp, fp))=>(uid, tp/(tp+fp))}
+                              .persist(StorageLevel.MEMORY_AND_DISK)
+
+    //Recall tp/(tp+fn)
+    val user_recall=user_tp.join(user_fn)
+                           .map{case (uid,(tp, fn))=>(uid,tp/(tp+fn))}
+                           .persist(StorageLevel.MEMORY_AND_DISK)
+
+    //Calculate the F1-score F1-Score = (2*precision*recall) /(Precision+Recall)
+    val user_f1_score=user_precision.join(user_recall).map { case (uid, (precision, recall)) =>
+      val f1_score = (2.0 * precision * recall) / (precision + recall)
+      if (f1_score.isNaN)
+        (uid, 0.0)
+      else
+        (uid, 0.0)
+    }.persist(StorageLevel.MEMORY_AND_DISK)
+
+    //Name of the output folder
     val format = new SimpleDateFormat("y-M-d-hh-mm-ss")
     val dateString=format.format(Calendar.getInstance().getTime)
-    val myRDD = top_N_items.map{case (u, lb_f)=>u+", "+ lb_f.mkString(",") }
-                            .saveAsTextFile("s3n://prs-simone/"+dateString+"/train")
-    rdd_splitted.map{case (ugid, (vtr, vt))=> ugid+", "+vt.map(y=>y.get[UDTValue]("book").get[Int]("gid"))
-                                                          .toArray
-                                                          .mkString(",")}
-                .saveAsTextFile("s3n://prs-simone/"+dateString+"/test")
+    var ResultfolderName = ""
+    if(Local)
+      ResultfolderName=ResultfolderName+SavePathLocal+dateString+"-"+users_size+"users-"+NRecemendedItems+"items"+NSimilarUsers+"sim"
+    else
+      ResultfolderName=ResultfolderName+SavePathS3+dateString+"-"+users_size+"users"+NRecemendedItems+"items"+NSimilarUsers+"sim"
 
+    //Save the measures
+    user_precision.coalesce(20, true).saveAsTextFile(ResultfolderName+"/user_precision")
+    user_recall.coalesce(20, true).saveAsTextFile(ResultfolderName+"/user_recall")
+    user_f1_score.coalesce(20, true).saveAsTextFile(ResultfolderName+"/user_f1_score")
 
-    //Save accuracy rate, mean, max
-    accuracy_rate.saveAsTextFile("s3n://prs-simone/"+dateString+"/accuracy_rate")
-    val acc_rate=accuracy_rate.map(_._2).collect()
-
-    sc.parallelize( List(acc_rate.sum / acc_rate.length.toDouble, acc_rate.max )).saveAsTextFile("s3n://prs-simone/"+dateString+"/mean_accuracy_rate")
-
+    //Stop Spark context
     sc.stop()
+  }
 
-
-
-    //Save the results to cassandra
-    /*case class Recommendation(id: UUID, user_gid: Int, item_recommended: scala.collection.immutable.Vector[Int])
-    val collection = sc.parallelize(Seq(Recommendation( UUID.randomUUID(), 23, Vector(1,2,3)),
-                                        Recommendation( UUID.randomUUID(), 24, Vector(2,3,6))))
-
-
-
-    collection.saveToCassandra("prs", "recommendation", SomeColumns("id", "user_gid", "item_recommended"))
-    */
+  //Function for calculate the cosine similarity between two vector
+  def cosineSimilarityList(a1: List[(Int, Double)], a2: List[(Int, Double)]):Double={
+    val common=a1.intersect(a2)
+    if(common.isEmpty) {
+      0.0
+    }else {
+      val common_values=common.map(s => (a1.find(_._1 == s._1).get._2,  a2.find(_._1 == s._1).get._2))
+      val num = common_values.map(x=>x._1+x._2).sum
+      val m1_d = Math.sqrt(common_values.map(x=> Math.pow(x._1, 2)).sum)
+      val m2_d = Math.sqrt(common_values.map(x=> Math.pow(x._2, 2)).sum)
+      num / (m1_d * m2_d)
+    }
   }
 }
