@@ -70,9 +70,7 @@ object HybridRecomendationGoodreads {
         .setAppName("Hybrid Algorithm")
         .setMaster("local[8]")
     } else {
-      conf//.set("spark.cassandra.connection.host", "54.229.78.63") //Cassandra server configuration
-          //.set("spark.cassandra.input.fetch.size_in_rows", "10") //Limit fetch size
-          .setJars(Seq(System.getProperty("user.dir") + "/my-project-assembly.jar")) //Dependencies jar
+      conf.setJars(Seq(System.getProperty("user.dir") + "/my-project-assembly.jar")) //Dependencies jar
     }
 
     //Create a Spark context
