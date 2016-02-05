@@ -1,4 +1,4 @@
-# Products Recommender System improved with social netowrk information
+# Product Recommender System improved with social netowrk information
 ## General information
 Creator: Simone Cogno, simone.cogno@master.hes-so.ch
 
